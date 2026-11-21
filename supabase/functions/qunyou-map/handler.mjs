@@ -2,6 +2,7 @@ import { createApp } from '../_shared/markers.mjs';
 import { createSupabaseStore } from '../_shared/supabase-store.mjs';
 
 const routes = new Set(['/api/markers', '/api/admin']);
+const mapOrigins = new Set(['https://jace050313.github.io', 'https://kjzmap.github.io']);
 
 export function createMapFunction({ projectUrl, secretKey, password, sessionSecret }) {
   const configured = projectUrl && secretKey;
@@ -18,7 +19,7 @@ export function createMapFunction({ projectUrl, secretKey, password, sessionSecr
       'X-Content-Type-Options': 'nosniff'
     });
     const origin = request.headers.get('origin');
-    if (origin && origin !== 'https://jace050313.github.io') {
+    if (origin && !mapOrigins.has(origin)) {
       return Response.json({ error: '此来源无法访问标记服务。' }, { status: 403, headers });
     }
     if (origin) {
