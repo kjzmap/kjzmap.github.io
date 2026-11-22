@@ -14,6 +14,7 @@
   var LS_MARKERS = 'qunmap.markers.v1';
   var LS_OWNER = 'qunmap.owner.v2';
   var LS_MAP_MODE = 'qunmap.mapmode.v1';
+  var LS_CLUSTER = 'qunmap.cluster.v1';
   var NAME_MAX = 16;
   var AVATAR_PATTERN = /^data:image\/jpeg;base64,[A-Za-z0-9+/]+={0,2}$/;
   var MIN_ZOOM = 3;
@@ -23,6 +24,11 @@
   var MAX_ZOOM = 14;
   var SIMPLE_MAX_ZOOM = 10;
   var CITY_LABEL_ZOOM = 7;
+  var CLUSTER_RADIUS = 65;
+  var CLUSTER_MIN_RADIUS = 44;
+  var AVATAR_RADIUS = 20;
+  var SPIDER_SPACING = 52;
+  var SPIDER_PAGED_MIN_RADIUS = 88;
   var EMOJIS = ['😀', '😄', '😎', '🥳', '🐱', '🐶', '🐼', '🦊', '🐸', '🐳', '🍊', '🍓', '🍰', '🍜', '🍵', '🎧', '🎸', '🚀', '✈️', '🪐', '🌈', '⚽', '🔥', '🌰', '🚦', '🥐', '🍧', '🍬', '🍡', '🐚', '🪁'];
   var EMOJI_SET = new Set(EMOJIS);
 
@@ -57,6 +63,7 @@
     pickLabel: document.getElementById('pickLabel'),
     ctaWrap: document.querySelector('.cta-wrap'),
     mapMode: document.getElementById('mapMode'),
+    clusterToggle: document.getElementById('clusterToggle'),
     avatarFile: document.getElementById('avatarFile'),
     clearAvatar: document.getElementById('clearAvatar'),
     avatarStatus: document.getElementById('avatarStatus'),
@@ -83,6 +90,7 @@
     ready: false,
     mode: 'local',
     mapMode: 'standard',
+    clusterEnabled: false,
     markers: [],
     ownerKey: null,
     admin: false,
@@ -113,8 +121,17 @@
   var provinceLabelLayer = null;
   var cityLayer = null;
   var markerLayer = null;
+  var spiderLayer = null;
   var tempMarker = null;
-  var markerIndex = Object.create(null);
+  var markerIndex = new Map();
+  var renderedMarkers = [];
+  var spider = null;
+  var hoveredPin = null;
+  var highlightedPin = null;
+  var markerFrame = 0;
+  var pendingPerson = null;
+  var personPopup = null;
+  var popupTrigger = null;
   var zoomControlEl = null;
   var zoomRange = null;
   var zoomInBtn = null;
@@ -137,6 +154,7 @@
 
     createMap();
     bindEvents();
+    setClustering(loadClustering(), false);
     applyMapMode(loadMapMode(), false);
     wasCompact = isCompact();
     setPeopleOpen(!wasCompact);
@@ -186,6 +204,27 @@
     tileLayer.on('tileload', function () { state.tileLoads += 1; });
 
     markerLayer = L.layerGroup().addTo(map);
+    spiderLayer = L.layerGroup().addTo(map);
+    map.on('zoomend', function () {
+      if (state.clusterEnabled) renderMarkers(visibleMarkers());
+    });
+    map.on('moveend', function () {
+      if (pendingPerson !== null) {
+        var selection = pendingPerson;
+        pendingPerson = null;
+        revealPerson(selection);
+      }
+      queueMarkerLayout();
+    });
+    map.on('popupclose', function (event) {
+      if (event.popup !== personPopup) return;
+      personPopup = null;
+      popupTrigger = null;
+    });
+    map.on('resize', function () {
+      collapseSpider();
+      if (state.ready && state.clusterEnabled) renderMarkers(visibleMarkers());
+    });
     buildBoundaryLayers();
 
     if (window.matchMedia && window.matchMedia('(max-width: 720px)').matches) {
@@ -310,6 +349,20 @@
     }
   }
 
+  function loadClustering() {
+    try { return localStorage.getItem(LS_CLUSTER) === 'on'; } catch (error) { return false; }
+  }
+
+  function setClustering(enabled, persist) {
+    state.clusterEnabled = enabled;
+    els.map.classList.toggle('map-clustering', enabled);
+    els.clusterToggle.setAttribute('aria-checked', String(enabled));
+    if (persist) {
+      try { localStorage.setItem(LS_CLUSTER, enabled ? 'on' : 'off'); } catch (error) { /* 忽略 */ }
+    }
+    if (state.ready) renderMarkers(visibleMarkers());
+  }
+
   function currentMinZoom() {
     return state.mapMode === 'simple' ? SIMPLE_MIN_ZOOM : MIN_ZOOM;
   }
@@ -319,6 +372,7 @@
   }
 
   function applyMapMode(mode, persist) {
+    collapseSpider();
     var next = mode === 'simple' ? 'simple' : 'standard';
     if (next === 'simple' && !provinceLayer) {
       next = 'standard';
@@ -357,6 +411,7 @@
     syncZoomControl();
     updateMapModeButtons();
     syncSimpleLabels();
+    if (state.ready && state.clusterEnabled) renderMarkers(visibleMarkers());
 
     if (persist) {
       try { localStorage.setItem(LS_MAP_MODE, state.mapMode); } catch (error) { /* 忽略 */ }
@@ -545,7 +600,11 @@
     });
 
     map.on('click', function (event) {
-      if (!state.picking || state.saving) return;
+      if (!state.picking) {
+        collapseSpider();
+        return;
+      }
+      if (state.saving) return;
       setTemp(event.latlng);
     });
 
@@ -554,6 +613,9 @@
     });
     els.peopleClose.addEventListener('click', function () { setPeopleOpen(false); });
     els.peopleScrim.addEventListener('click', function () { setPeopleOpen(false); });
+    els.clusterToggle.addEventListener('click', function () {
+      setClustering(!state.clusterEnabled, true);
+    });
 
     if (els.mapMode) {
       els.mapMode.addEventListener('click', function (event) {
@@ -569,7 +631,7 @@
       var target = event.target;
       var button = target && target.closest ? target.closest('.person') : null;
       if (!button) return;
-      focusPerson(button.getAttribute('data-id'));
+      focusPerson(button.getAttribute('data-id'), button.matches(':focus-visible'));
     });
 
     window.addEventListener('resize', function () {
@@ -582,13 +644,26 @@
     document.addEventListener('keydown', function (event) {
       if (event.key !== 'Escape' || state.saving || els.manageDialog.open) return;
 
-      if (state.picking) {
+      if (personPopup && map.hasLayer(personPopup)) {
+        event.preventDefault();
+        event.stopPropagation();
+        var trigger = popupTrigger;
+        closePersonPopup();
+        if (trigger && trigger.isConnected) trigger.focus({ preventScroll: true });
+      } else if (spider) {
+        event.preventDefault();
+        event.stopPropagation();
+        var focused = document.activeElement;
+        collapseSpider(spider.layer.getElement().contains(focused) || spider.pins.some(function (pin) {
+          return pin.button === focused;
+        }));
+      } else if (state.picking) {
         event.preventDefault();
         closePicker();
       } else if (state.peopleOpen) {
         setPeopleOpen(false);
       }
-    });
+    }, true);
   }
 
   /* ---------- 数据 ---------- */
@@ -743,6 +818,7 @@
   function refreshUI() {
     var visible = visibleMarkers();
     renderMarkers(visible);
+    renderPeople(visible);
     updateStats(visible.length);
     if (els.manageDialog.open) renderManage();
     clearTimeout(expiryTimer);
@@ -757,27 +833,361 @@
   /* ---------- 渲染 ---------- */
 
   function renderMarkers(visible) {
+    collapseSpider();
     markerLayer.clearLayers();
-    markerIndex = Object.create(null);
+    markerIndex.clear();
+    hoveredPin = null;
+    highlightedPin = null;
+    var groups = state.clusterEnabled ? groupMarkers(visible) : visible.map(function (item) {
+      return { items: [item], anchor: L.latLng(item.lat, item.lng) };
+    });
+    renderedMarkers = groups.map(function (group) {
+      var entry = group.items.length === 1
+        ? addPersonPin(group.items[0], group.anchor, markerLayer, 0)
+        : addClusterPin(group);
+      group.entry = entry;
+      group.items.forEach(function (item) { markerIndex.set(item.id, group); });
+      return entry;
+    });
 
-    visible.forEach(function (item) {
-      var marker = L.marker([item.lat, item.lng], {
-        icon: buildIcon(item.name, item.emoji, item.avatar_url, false),
-        interactive: false,
-        keyboard: false,
-        riseOnHover: false
+    if (state.pulseId !== null) {
+      var group = markerIndex.get(state.pulseId);
+      if (group) pulseMarker(group.entry.layer);
+      state.pulseId = null;
+    }
+    queueMarkerLayout();
+  }
+
+  function groupMarkers(items) {
+    var zoom = map.getZoom();
+    var progress = (zoom - currentMinZoom()) / (currentMaxZoom() - currentMinZoom());
+    var radius = Math.max(CLUSTER_MIN_RADIUS, CLUSTER_RADIUS - (isCompact() ? 5 : 0) -
+      (CLUSTER_RADIUS - CLUSTER_MIN_RADIUS) * progress);
+    var radiusSquared = radius * radius;
+    var cells = new Map();
+    var points = new Map();
+
+    // 截到同一屏幕像素的标记共用一个点，避免重复比较同坐标用户。
+    items.forEach(function (item) {
+      var pixel = map.project([item.lat, item.lng], zoom).round();
+      var key = pixel.x + ':' + pixel.y;
+      var point = points.get(key);
+      if (!point) {
+        point = { pixel: pixel, items: [], parent: null };
+        points.set(key, point);
+      }
+      point.items.push(item);
+    });
+
+    function rootOf(point) {
+      while (point.parent) {
+        if (point.parent.parent) point.parent = point.parent.parent;
+        point = point.parent;
+      }
+      return point;
+    }
+
+    points.forEach(function (point) {
+      var x = Math.floor(point.pixel.x / radius);
+      var y = Math.floor(point.pixel.y / radius);
+      for (var dx = -1; dx <= 1; dx += 1) {
+        for (var dy = -1; dy <= 1; dy += 1) {
+          var neighbors = cells.get((x + dx) + ':' + (y + dy)) || [];
+          neighbors.forEach(function (neighbor) {
+            var deltaX = point.pixel.x - neighbor.pixel.x;
+            var deltaY = point.pixel.y - neighbor.pixel.y;
+            if (deltaX * deltaX + deltaY * deltaY > radiusSquared) return;
+            var root = rootOf(neighbor);
+            var current = rootOf(point);
+            if (root !== current) current.parent = root;
+          });
+        }
+      }
+      var key = x + ':' + y;
+      if (!cells.has(key)) cells.set(key, []);
+      cells.get(key).push(point);
+    });
+
+    var groups = new Map();
+    points.forEach(function (point) {
+      var root = rootOf(point);
+      if (!groups.has(root)) groups.set(root, { items: [], points: [], sum: L.point(0, 0) });
+      var group = groups.get(root);
+      point.items.forEach(function (item) { group.items.push(item); });
+      group.points.push(point);
+      group.sum = group.sum.add(point.pixel.multiplyBy(point.items.length));
+    });
+
+    return Array.from(groups.values(), function (group) {
+      var center = group.sum.divideBy(group.items.length);
+      var anchor = group.points.reduce(function (best, point) {
+        return point.pixel.distanceTo(center) < best.pixel.distanceTo(center) ? point : best;
       });
+      // 选最靠近人群中心的真实位置，避免平均坐标上的气泡遮挡另一个簇。
+      return { items: group.items, anchor: L.latLng(anchor.items[0].lat, anchor.items[0].lng) };
+    });
+  }
 
-      marker.addTo(markerLayer);
-      markerIndex[item.id] = marker;
+  function mapButton(className, text, label) {
+    var button = document.createElement('button');
+    button.type = 'button';
+    button.className = className;
+    button.textContent = text;
+    button.setAttribute('aria-label', label);
+    L.DomEvent.disableClickPropagation(button);
+    return button;
+  }
 
-      if (state.pulseId === item.id) {
-        pulseMarker(marker);
-        state.pulseId = null;
+  function addPersonPin(item, position, layerGroup, zIndex) {
+    var pin = buildPin(item.name, item.emoji, item.avatar_url, false);
+    var button = mapButton('qm-avatar-button', '', '查看 ' + item.name + ' 的标记资料');
+    var label = pin.querySelector('.qm-name');
+    button.appendChild(pin.firstElementChild);
+    pin.prepend(button);
+    var layer = L.marker(position, {
+      icon: buildIcon(pin, 'qm-person-icon'),
+      interactive: false,
+      keyboard: false,
+      zIndexOffset: zIndex
+    }).addTo(layerGroup);
+    var entry = { item: item, layer: layer, button: button, label: label, zIndex: zIndex, size: AVATAR_RADIUS };
+
+    button.addEventListener('click', function () {
+      if (!state.picking) openPersonPopup(entry);
+    });
+    button.addEventListener('pointerenter', function (event) {
+      if (event.pointerType === 'touch') return;
+      hoveredPin = entry;
+      queueMarkerLayout();
+    });
+    button.addEventListener('pointerleave', function () {
+      if (hoveredPin === entry) hoveredPin = null;
+      queueMarkerLayout();
+    });
+    button.addEventListener('focus', queueMarkerLayout);
+    button.addEventListener('blur', queueMarkerLayout);
+    return entry;
+  }
+
+  function addClusterPin(group) {
+    var count = group.items.length;
+    var button = mapButton('qm-cluster-button', String(count), '展开 ' + count + ' 位群友');
+    button.setAttribute('aria-expanded', 'false');
+    var layer = L.marker(group.anchor, {
+      icon: L.divIcon({ className: 'qm-icon qm-cluster-icon', html: button, iconSize: [44, 44], iconAnchor: [22, 42] }),
+      interactive: false,
+      keyboard: false
+    }).addTo(markerLayer);
+    button.addEventListener('click', function () {
+      if (!state.picking) expandSpider(group, 0, null, button.matches(':focus-visible'));
+    });
+    return { layer: layer, button: button, size: 22 };
+  }
+
+  function spiderViewport() {
+    var size = map.getSize();
+    var sidebar = state.peopleOpen && !isCompact() ? els.peoplePanel.getBoundingClientRect().right : 0;
+    var ringSize = 2 * (SPIDER_PAGED_MIN_RADIUS + AVATAR_RADIUS);
+    var verticalPadding = Math.max(8, (size.y - ringSize) / 2);
+    var rightPadding = Math.min(62, Math.max(12, size.x - ringSize - 12));
+    return L.bounds(
+      [sidebar + 12, Math.min(isCompact() ? 112 : 86, verticalPadding)],
+      [size.x - rightPadding, size.y - Math.min(106, verticalPadding)]
+    );
+  }
+
+  function expandSpider(group, page, selectedId, moveFocus) {
+    collapseSpider();
+    var viewport = spiderViewport();
+    var maxRadius = Math.max(30, Math.min(isCompact() ? 110 : 145,
+      Math.min(viewport.getSize().x, viewport.getSize().y) / 2 - AVATAR_RADIUS));
+    var capacity = Math.min(12, Math.floor(Math.PI / Math.asin(SPIDER_SPACING / (2 * maxRadius))));
+    var pages = Math.ceil(group.items.length / capacity);
+    var selectedIndex = selectedId === null ? -1 : group.items.findIndex(function (item) { return item.id === selectedId; });
+    if (selectedIndex >= 0) page = Math.floor(selectedIndex / capacity);
+    var items = group.items.slice(page * capacity, (page + 1) * capacity);
+    var minRadius = pages > 1 ? SPIDER_PAGED_MIN_RADIUS : 70;
+    var radius = Math.min(maxRadius, Math.max(minRadius, SPIDER_SPACING / (2 * Math.sin(Math.PI / Math.max(2, items.length)))));
+    var center = map.latLngToContainerPoint(group.anchor).subtract([0, AVATAR_RADIUS]);
+    var size = map.getSize();
+    if (size.y <= 430 && isCompact()) {
+      var toolbarEdge = els.mapMode.getBoundingClientRect().right;
+      center.x = Math.max(size.x / 2 + 18, toolbarEdge + radius * .8 + AVATAR_RADIUS);
+    }
+    var inset = radius + AVATAR_RADIUS;
+    var centerBounds = L.bounds(viewport.min.add([inset, inset]), viewport.max.subtract([inset, inset]));
+    center.x = Math.max(centerBounds.min.x, Math.min(center.x, centerBounds.max.x));
+    center.y = Math.max(centerBounds.min.y, Math.min(center.y, centerBounds.max.y));
+
+    var controls = document.createElement('div');
+    controls.className = 'qm-spider-controls';
+    var close = mapButton('qm-cluster-button qm-spider-close', '×', '收起 ' + group.items.length + ' 位群友');
+    controls.appendChild(close);
+    close.addEventListener('click', function () { collapseSpider(close.matches(':focus-visible')); });
+    var next = null;
+    if (pages > 1) {
+      next = mapButton('qm-spider-next', (page + 1) + ' / ' + pages + ' ›',
+        '显示下一页群友，当前第 ' + (page + 1) + ' 页，共 ' + pages + ' 页');
+      controls.appendChild(next);
+      next.addEventListener('click', function () {
+        var restore = next.matches(':focus-visible');
+        expandSpider(group, (page + 1) % pages, null, false);
+        if (restore) spider.layer.getElement().querySelector('.qm-spider-next').focus({ preventScroll: true });
+      });
+    }
+    var controlLayer = L.marker(map.containerPointToLatLng(center), {
+      icon: L.divIcon({ className: 'qm-icon qm-spider-icon', html: controls, iconSize: [80, 40], iconAnchor: [40, 18] }),
+      interactive: false,
+      keyboard: false,
+      zIndexOffset: 1000
+    }).addTo(spiderLayer);
+
+    var pins = items.map(function (item, index) {
+      var angle = (index / items.length) * 2 * Math.PI - Math.PI / (items.length === 2 ? 4 : 2);
+      var position = map.containerPointToLatLng(center.add([Math.cos(angle) * radius, Math.sin(angle) * radius + AVATAR_RADIUS]));
+      L.polyline([[item.lat, item.lng], position], {
+        color: '#466786', weight: 1.5, opacity: .76, dashArray: '4 3', interactive: false
+      }).addTo(spiderLayer);
+      return addPersonPin(item, position, spiderLayer, 1000);
+    });
+    spider = { group: group, pins: pins, layer: controlLayer };
+    document.body.classList.add('spider-open');
+    group.entry.button.setAttribute('aria-expanded', 'true');
+    queueMarkerLayout();
+    if (moveFocus) pins[0].button.focus({ preventScroll: true });
+    return pins.find(function (pin) { return pin.item.id === selectedId; });
+  }
+
+  function collapseSpider(restoreFocus) {
+    closePersonPopup();
+    if (!spider) return;
+    var entry = spider.group.entry;
+    if (spider.pins.includes(hoveredPin)) hoveredPin = null;
+    if (spider.pins.includes(highlightedPin)) highlightedPin = null;
+    spiderLayer.clearLayers();
+    spider = null;
+    document.body.classList.remove('spider-open');
+    entry.button.setAttribute('aria-expanded', 'false');
+    entry.layer.getElement().classList.remove('is-obscured');
+    if (restoreFocus) entry.button.focus({ preventScroll: true });
+    queueMarkerLayout();
+  }
+
+  function closePersonPopup() {
+    if (personPopup) map.closePopup(personPopup);
+    personPopup = null;
+    popupTrigger = null;
+  }
+
+  function openPersonPopup(entry) {
+    var item = entry.item;
+    var detail = document.createElement('div');
+    detail.className = 'qm-person-detail';
+    detail.appendChild(buildAvatar(item.name, item.emoji, item.avatar_url));
+    var body = document.createElement('div');
+    detail.appendChild(body);
+    var name = document.createElement('strong');
+    name.textContent = item.name;
+    body.appendChild(name);
+    var coords = document.createElement('div');
+    coords.className = 'qm-person-coords';
+    coords.textContent = formatLat(item.lat) + ' · ' + formatLng(item.lng);
+    body.appendChild(coords);
+    detail.tabIndex = -1;
+    detail.setAttribute('role', 'group');
+    detail.setAttribute('aria-label', item.name + '，' + coords.textContent);
+    var moveFocus = entry.button.matches(':focus-visible');
+    closePersonPopup();
+    popupTrigger = entry.button;
+    personPopup = L.popup({ className: 'qm-person-popup', offset: [0, -43], maxWidth: 245 })
+      .setLatLng(entry.layer.getLatLng()).setContent(detail).openOn(map);
+    if (moveFocus) detail.focus({ preventScroll: true });
+  }
+
+  function markerBox(entry) {
+    var center = map.latLngToContainerPoint(entry.layer.getLatLng()).subtract([0, AVATAR_RADIUS]);
+    return L.bounds(center.subtract([entry.size, entry.size]), center.add([entry.size, entry.size]));
+  }
+
+  function queueMarkerLayout() {
+    if (!markerFrame) markerFrame = requestAnimationFrame(layoutMarkers);
+  }
+
+  function layoutMarkers() {
+    markerFrame = 0;
+    if (!state.clusterEnabled) {
+      renderedMarkers.forEach(function (entry) { entry.button.disabled = state.picking; });
+      return;
+    }
+    var viewport = L.bounds([4, 4], map.getSize().subtract([4, 4]));
+    var spiderPins = spider ? spider.pins : [];
+    var expandedBoxes = spiderPins.map(markerBox);
+    if (spider) {
+      spider.layer.getElement().querySelectorAll('button').forEach(function (button) {
+        var rect = button.getBoundingClientRect();
+        expandedBoxes.push(L.bounds([rect.left, rect.top], [rect.right, rect.bottom]));
+      });
+    }
+    var blocked = expandedBoxes.slice();
+    var labels = [];
+    renderedMarkers.concat(spiderPins).forEach(function (entry) {
+      var box = markerBox(entry);
+      var obscured = spider && (entry === spider.group.entry ||
+        (!spiderPins.includes(entry) && expandedBoxes.some(function (other) { return other.overlaps(box); })));
+      entry.layer.getElement().classList.toggle('is-obscured', Boolean(obscured));
+      entry.button.disabled = state.picking;
+      if (!obscured && viewport.intersects(box) && !spiderPins.includes(entry)) blocked.push(box);
+      if (!entry.label) return;
+
+      var active = !obscured && (entry === hoveredPin || entry === highlightedPin || entry.button.matches(':focus-visible'));
+      var priority = entry.zIndex ? 1 : 0;
+      if (active) priority = entry === hoveredPin ? 3 : 2;
+      var zIndex = entry.zIndex + (active ? priority * 10000 : 0);
+      if (entry.layer.options.zIndexOffset !== zIndex) entry.layer.setZIndexOffset(zIndex);
+      entry.button.classList.toggle('is-emphasized', active);
+      if (!obscured && viewport.intersects(box)) {
+        labels.push({ label: entry.label, center: box.getCenter(), priority: priority });
+      } else {
+        entry.label.removeAttribute('data-placement');
       }
     });
 
-    renderPeople(visible);
+    var width = map.getSize().x;
+    var overlays = [document.querySelector('.brand'), state.peopleOpen ? els.peoplePanel : els.peopleToggle,
+      els.mapMode, zoomControlEl, state.picking ? els.sheet : els.ctaWrap];
+    overlays.forEach(function (element) {
+      if (!element || element.hidden || getComputedStyle(element).visibility === 'hidden' ||
+        (element === els.peoplePanel && isCompact()) ||
+        (element === els.peopleToggle && !element.classList.contains('is-visible'))) return;
+      var rect = element.getBoundingClientRect();
+      if (rect.width && rect.right > 0 && rect.left < width) {
+        blocked.push(L.bounds([rect.left, rect.top], [rect.right, rect.bottom]));
+      }
+    });
+
+    labels.sort(function (a, b) { return b.priority - a.priority; }).forEach(function (entry) {
+      var label = entry.label;
+      var center = entry.center;
+      var w = label.offsetWidth;
+      var h = label.offsetHeight;
+      var gap = AVATAR_RADIUS + 5;
+      var candidates = [
+        ['below', center.x - w / 2, center.y + gap],
+        ['above', center.x - w / 2, center.y - gap - h],
+        ['right', center.x + gap, center.y - h / 2],
+        ['left', center.x - gap - w, center.y - h / 2]
+      ];
+      var placement = candidates.find(function (candidate) {
+        var x = candidate[1];
+        var y = candidate[2];
+        var box = L.bounds([x - 2, y - 2], [x + w + 2, y + h + 2]);
+        if (!viewport.contains(box) || blocked.some(function (other) { return other.overlaps(box); })) return false;
+        blocked.push(box);
+        return true;
+      });
+      if (placement) label.setAttribute('data-placement', placement[0]);
+      else label.removeAttribute('data-placement');
+    });
   }
 
   function renderPeople(visible) {
@@ -867,55 +1277,68 @@
     els.peopleToggle.classList.toggle('is-visible', !next);
     els.peopleToggle.setAttribute('aria-expanded', next ? 'true' : 'false');
     document.body.classList.toggle('people-open', compact && next);
+    collapseSpider();
+    queueMarkerLayout();
   }
 
-  function focusPerson(id) {
-    var item = null;
-    for (var i = 0; i < state.markers.length; i += 1) {
-      if (state.markers[i].id === id) {
-        item = state.markers[i];
-        break;
-      }
-    }
+  function focusPerson(id, moveFocus) {
+    var group = markerIndex.get(id);
+    var item = group && group.items.find(function (person) { return person.id === id; });
     if (!item) return;
 
     if (isCompact() && state.peopleOpen) setPeopleOpen(false);
+    collapseSpider();
+    map.stop();
+    pendingPerson = { id: id, moveFocus: moveFocus };
+    var animate = !window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
     map.flyTo([item.lat, item.lng], Math.min(currentMaxZoom(), Math.max(map.getZoom(), 9)), {
-      duration: .8
+      duration: .8, animate: animate
     });
+  }
 
-    var layer = markerIndex[id];
-    var element = layer && layer.getElement();
-    var pin = element && element.querySelector('.qm-pin');
+  function revealPerson(selection) {
+    var group = markerIndex.get(selection.id);
+    if (!group || state.picking) return;
+    var entry = group.items.length === 1 ? group.entry : expandSpider(group, 0, selection.id, false);
+    var pin = entry.layer.getElement().querySelector('.qm-pin');
     if (!pin) return;
 
+    highlightedPin = entry;
+    if (selection.moveFocus) entry.button.focus({ preventScroll: true });
+    queueMarkerLayout();
     clearTimeout(focusTimer);
     pin.classList.remove('is-focus');
     void pin.offsetWidth;
     pin.classList.add('is-focus');
     focusTimer = setTimeout(function () {
       pin.classList.remove('is-focus');
+      if (highlightedPin === entry) highlightedPin = null;
+      queueMarkerLayout();
     }, 1600);
   }
 
   function pulseMarker(marker) {
     var element = marker.getElement();
     if (!element) return;
-    var pin = element.querySelector('.qm-pin');
+    var pin = element.querySelector('.qm-pin, .qm-cluster-button');
     if (!pin) return;
 
     pin.classList.add('is-new');
     setTimeout(function () { pin.classList.remove('is-new'); }, 1500);
   }
 
-  function buildIcon(name, emoji, avatarUrl, isTemp) {
+  function buildIcon(pin, className) {
     return L.divIcon({
-      className: 'qm-icon',
-      html: buildPin(name, emoji, avatarUrl, isTemp),
+      className: className ? 'qm-icon ' + className : 'qm-icon',
+      html: pin,
       iconSize: [136, 76],
       iconAnchor: [68, 40]
     });
+  }
+
+  function buildTempIcon() {
+    return buildIcon(buildPin(els.name.value.trim(), state.emoji, state.avatar, true));
   }
 
   function buildPin(name, emoji, avatarUrl, isTemp) {
@@ -999,6 +1422,7 @@
   function openPicker(existing) {
     if (state.picking) return;
 
+    collapseSpider();
     state.picking = true;
     state.editing = existing || null;
     state.removeArmed = false;
@@ -1037,6 +1461,7 @@
     els.ctaWrap.classList.add('is-hidden');
     document.body.classList.add('picking');
     document.body.classList.add('sheet-open');
+    queueMarkerLayout();
 
     if (!window.matchMedia || !window.matchMedia('(pointer: coarse)').matches) {
       setTimeout(function () { els.name.focus({ preventScroll: true }); }, 80);
@@ -1065,6 +1490,7 @@
     els.ctaWrap.classList.remove('is-hidden');
     document.body.classList.remove('picking');
     document.body.classList.remove('sheet-open');
+    queueMarkerLayout();
 
     if (!state.saving) {
       els.pickBtn.focus({ preventScroll: true });
@@ -1076,7 +1502,7 @@
 
     if (!tempMarker) {
       tempMarker = L.marker(state.tempLatLng, {
-        icon: buildIcon(els.name.value.trim(), state.emoji, state.avatar, true),
+        icon: buildTempIcon(),
         draggable: true,
         autoPan: true,
         keyboard: false,
@@ -1219,7 +1645,7 @@
     clearTimeout(tempRefreshTimer);
     tempRefreshTimer = setTimeout(function () {
       if (!tempMarker) return;
-      tempMarker.setIcon(buildIcon(els.name.value.trim(), state.emoji, state.avatar, true));
+      tempMarker.setIcon(buildTempIcon());
     }, 140);
   }
 

@@ -2,6 +2,12 @@
 
 网页由 GitHub Pages 从 `main` 分支根目录发布。共享模式通过 Supabase Edge Function 读写 PostgreSQL。任何访问地图的人都可以看到公开且未到期的群友标记，也可以添加自己的标记。编辑和删除自己的共享标记需要原浏览器保存的管理凭证。
 
+## 更新地图前端
+
+「聚合」默认关闭，头像和昵称沿用原来的位置。开启后，人数气泡会随地图缩放合并或拆开，点击可环形展开并查看同坐标群友。两种模式都可点击头像查看资料，地图会在当前浏览器记住开关状态。
+
+将 `index.html`、`app.js` 和 `styles.css` 的改动合入 `main`。GitHub Pages 发布完成后，检查线上地图能读取已有群友、开关默认关闭，再验证开启后的缩放、环形展开、头像资料和列表定位。原有的 Supabase 函数地址和数据库继续使用。
+
 ## 启用共享
 
 1. 在 Supabase 选定项目。保留 Data API 对 `public` schema 的访问，在 SQL Editor 执行 [数据库迁移](supabase/migrations/20261121000000_shared_markers.sql)。已用同名表的项目可重复执行该迁移。

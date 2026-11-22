@@ -9,7 +9,7 @@
 <title>群友地图 · 看看群友都在哪儿</title>
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="leaflet.css">
-<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="styles.css?v=2">
 </head>
 <body>
 <div id="map" aria-label="群友位置地图"></div>
@@ -55,9 +55,10 @@
   <b id="peopleToggleCount">0</b>
 </button>
 
-<div id="mapMode" class="map-mode" role="group" aria-label="地图模式">
+<div id="mapMode" class="map-mode" role="group" aria-label="地图显示">
   <button type="button" data-map-mode="standard" aria-pressed="true" title="道路和地点，适合日常查看">标准</button>
   <button type="button" data-map-mode="simple" aria-pressed="false" title="全球国界和中国省界，放大可看国内城市">省界</button>
+  <button id="clusterToggle" class="cluster-toggle" type="button" role="switch" aria-checked="false" title="合并附近的群友标记">聚合</button>
 </div>
 
 <div id="pickHint" class="pick-hint" hidden>
@@ -191,6 +192,6 @@
 <script src="china-geo.js"></script>
 <script src="world-geo.js"></script>
 <script src="leaflet.js"></script>
-<script src="app.js" defer></script>
+<script src="app.js?v=2" defer></script>
 </body>
 </html>
